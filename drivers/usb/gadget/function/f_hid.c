@@ -22,10 +22,21 @@
 
 #define HIDG_MINORS	4
 
+#define HIDG_FEATURE_REPORT_ID_IDX 0
+#define LOWBYTE(v)   ((__u8) (v))
+
 static int major, minors;
 static struct class *hidg_class;
 static DEFINE_IDA(hidg_ida);
 static DEFINE_MUTEX(hidg_ida_lock); /* protects access to hidg_ida */
+
+/*-------------------------------------------------------------------------*/
+/*                            HID gadget feature reports store             */
+static struct hid_feature_report {
+	uint16_t size;
+	uint8_t* data;
+	struct list_head head;
+} hid_feature_report_t;
 
 /*-------------------------------------------------------------------------*/
 /*                            HID gadget struct                            */
@@ -44,6 +55,7 @@ struct f_hidg {
 	unsigned char			idle;
 	unsigned short			report_desc_length;
 	char				*report_desc;
+	char 				*feature_report;
 	unsigned short			report_length;
 	/*
 	 * use_out_ep - if true, the OUT Endpoint (interrupt out method)
@@ -634,9 +646,15 @@ static int hidg_setup(struct usb_function *f,
 	struct f_hidg			*hidg = func_to_hidg(f);
 	struct usb_composite_dev	*cdev = f->config->cdev;
 	struct usb_request		*req  = cdev->req;
+	struct list_head 		* it;
+	struct hid_feature_report 	* ft_report;
 	int status = 0;
 	__u16 value, length;
 
+	/* 	HID_1.1  (7.2.1 Get_Report Request)
+		The wValue field specifies the Report Type in the high byte and the Report
+		ID in the low byte.
+	*/
 	value	= __le16_to_cpu(ctrl->wValue);
 	length	= __le16_to_cpu(ctrl->wLength);
 
@@ -649,6 +667,14 @@ static int hidg_setup(struct usb_function *f,
 		  | HID_REQ_GET_REPORT):
 		VDBG(cdev, "get_report\n");
 
+		list_for_each(it, &hid_feature_report_t.head) {
+			ft_report = list_entry(it, struct hid_feature_report, head);
+			if(LOWBYTE(value) == ft_report->data[HIDG_FEATURE_REPORT_ID_IDX] && length == ft_report->size) {
+				memcpy(req->buf, ft_report->data,  ft_report->size);
+				length = ft_report->size;
+				goto respond;		
+			}
+		}
 		/* send an empty report */
 		length = min_t(unsigned, length, hidg->report_length);
 		memset(req->buf, 0x0, length);
@@ -1148,6 +1174,60 @@ end:
 
 CONFIGFS_ATTR(f_hid_opts_, report_desc);
 
+static ssize_t f_hid_opts_feature_report_show(struct config_item *item, char *page)
+{
+	
+	struct f_hid_opts *opts = to_f_hid_opts(item);
+	struct list_head * pos;
+	struct hid_feature_report * report;
+	int result = 0;
+
+	mutex_lock(&opts->lock);
+
+	list_for_each(pos, &hid_feature_report_t.head) {
+        report = list_entry(pos, struct hid_feature_report, head);
+		result = report->size;
+		memcpy(page, report->data, report->size);
+		page += report->size;
+    }
+
+	mutex_unlock(&opts->lock);
+	return result;
+}
+
+static ssize_t f_hid_opts_feature_report_store(struct config_item *item,
+					    const char *page, size_t len)
+{
+	struct f_hid_opts *opts = to_f_hid_opts(item);
+	struct hid_feature_report * ptr;
+	int ret = -EBUSY;
+
+	mutex_lock(&opts->lock);
+
+	if (opts->refcnt)
+		goto end;
+	if (len > PAGE_SIZE) {
+		ret = -ENOSPC;
+		goto end;
+	}
+	ptr = (struct hid_feature_report *)kzalloc(sizeof(struct hid_feature_report), GFP_KERNEL);
+	ptr->data = kmemdup(page, len, GFP_KERNEL);
+	ptr->size = len;
+
+	if (!ptr || !ptr->data) {
+		kfree(ptr);
+		ret = -ENOMEM;
+		goto end;
+	}
+    list_add(&ptr->head, &hid_feature_report_t.head);
+	ret = len;
+end:
+	mutex_unlock(&opts->lock);
+	return ret;
+}
+
+CONFIGFS_ATTR(f_hid_opts_, feature_report);
+
 static ssize_t f_hid_opts_dev_show(struct config_item *item, char *page)
 {
 	struct f_hid_opts *opts = to_f_hid_opts(item);
@@ -1163,6 +1243,7 @@ static struct configfs_attribute *hid_attrs[] = {
 	&f_hid_opts_attr_no_out_endpoint,
 	&f_hid_opts_attr_report_length,
 	&f_hid_opts_attr_report_desc,
+	&f_hid_opts_attr_feature_report,
 	&f_hid_opts_attr_dev,
 	NULL,
 };
@@ -1203,7 +1284,8 @@ static struct usb_function_instance *hidg_alloc_inst(void)
 	struct f_hid_opts *opts;
 	struct usb_function_instance *ret;
 	int status = 0;
-
+	
+	INIT_LIST_HEAD(&hid_feature_report_t.head);
 	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
 	if (!opts)
 		return ERR_PTR(-ENOMEM);
@@ -1241,12 +1323,19 @@ static void hidg_free(struct usb_function *f)
 {
 	struct f_hidg *hidg;
 	struct f_hid_opts *opts;
-
+	struct list_head * it;
+	struct hid_feature_report * ft_report;
+	
 	hidg = func_to_hidg(f);
 	opts = container_of(f->fi, struct f_hid_opts, func_inst);
 	kfree(hidg->report_desc);
 	kfree(hidg->set_report_buf);
 	kfree(hidg);
+	list_for_each(it, &hid_feature_report_t.head) {
+		ft_report = list_entry(it, struct hid_feature_report, head);
+		kfree(ft_report->data);
+		list_del(&ft_report->head);
+	}
 	mutex_lock(&opts->lock);
 	--opts->refcnt;
 	mutex_unlock(&opts->lock);
